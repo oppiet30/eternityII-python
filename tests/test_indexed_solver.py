@@ -9,10 +9,10 @@ def test_single_piece_all_border():
 
 def test_rotated_scrambled_board():
     pieces = [
-        Piece(4, (0, 4, 3, 0)).rotated(1),
-        Piece(2, (0, 0, 1, 3)).rotated(2),
-        Piece(1, (0, 3, 2, 0)).rotated(3),
-        Piece(3, (2, 1, 0, 0)).rotated(1),
+        Piece(4, (3, 0, 0, 4)).rotated(1),
+        Piece(2, (0, 0, 3, 1)).rotated(2),
+        Piece(1, (0, 1, 2, 0)).rotated(3),
+        Piece(3, (2, 4, 0, 0)).rotated(1),
     ]
     result = next(solve(pieces), None)
     assert result is not None
