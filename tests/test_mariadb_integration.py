@@ -280,8 +280,8 @@ def test_claim_expiring_while_completion_waits_is_rejected(backend):
                 while not execute(backend,
                         "SELECT ID FROM information_schema.PROCESSLIST "
                         "WHERE DB=%s AND ID <> CONNECTION_ID() AND COMMAND <> 'Sleep' "
-                        "AND (INFO LIKE 'CALL proc_complete_job%%' OR INFO LIKE '%%scheduler_lock%%')",
-                        (backend['database'],)):
+                        "AND (INFO LIKE %s OR LOCATE('scheduler_lock',INFO)>0)",
+                        (backend['database'], 'CALL proc_complete_job%')):
                     assert time.monotonic() < deadline
                     time.sleep(0.01)
                 while not execute(backend,
