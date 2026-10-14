@@ -1,130 +1,159 @@
-import time
+"""MariaDB worker with fenced claims, independent heartbeats and checkpoints."""
 import json
-import mysql.connector
-from datetime import datetime
+import logging
+import os
+from pathlib import Path
+import threading
+import time
 
-WORKER_ID = 1   # set per-machine
+import mysql.connector
+
+from checkpoint_solver import solve_resumable
+from piece_loader import load_pieces
+
+LOG = logging.getLogger(__name__)
+WORKER_ID = int(os.environ.get('ETERNITY_WORKER_ID', '1'))
 HEARTBEAT_INTERVAL = 30
 JOB_POLL_INTERVAL = 5
 
+
 def db():
     return mysql.connector.connect(
-        host="localhost",
-        user="solver",
-        password="solverpass",
-        database="eternity2"
-    )
+        host=os.environ.get('ETERNITY_DB_HOST', 'localhost'),
+        port=int(os.environ.get('ETERNITY_DB_PORT', '3306')),
+        user=os.environ.get('ETERNITY_DB_USER', 'solver'),
+        password=os.environ.get('ETERNITY_DB_PASSWORD', ''),
+        database='eternity2', connection_timeout=10, autocommit=True)
 
-def heartbeat():
+
+def call_procedure(name, args=()):
+    """Use a fresh connection and drain CALL result sets before closing it."""
     conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE workers
-        SET last_heartbeat = NOW()
-        WHERE worker_id = %s
-    """, (WORKER_ID,))
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        cur = conn.cursor(dictionary=True)
+        try:
+            cur.callproc(name, args)
+            rows = []
+            for result in cur.stored_results():
+                rows.extend(result.fetchall())
+            return rows
+        finally:
+            cur.close()
+    finally:
+        conn.close()
 
-def fetch_jobs():
-    conn = db()
-    cur = conn.cursor(dictionary=True)
-    cur.execute("""
-        SELECT *
-        FROM jobs
-        WHERE assigned_worker = %s
-          AND status = 'running'
-        ORDER BY started_at ASC
-    """, (WORKER_ID,))
-    jobs = cur.fetchall()
-    cur.close()
-    conn.close()
-    return jobs
 
-def mark_failed(job_id, reason="worker error"):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE jobs
-        SET status='failed', finished_at=NOW()
-        WHERE job_id=%s
-    """, (job_id,))
-    conn.commit()
-    cur.close()
-    conn.close()
+def heartbeat(job=None):
+    call_procedure('proc_worker_heartbeat',
+                   (WORKER_ID, job['job_id'] if job else None,
+                    job['claim_token'] if job else None))
 
-def complete_job(job_id, score, depth, duration):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("CALL proc_complete_job(%s,%s,%s,%s)",
-                (job_id, score, depth, duration))
-    conn.commit()
-    cur.close()
-    conn.close()
 
-def run_solver(prefix, parameters):
-    """
-    Placeholder for your actual Eternity II solver.
-    Replace this with your C/Python solver call.
-    """
-    print(f"Running solver on prefix {prefix} with params {parameters}")
+def claim_job():
+    rows = call_procedure('proc_claim_job', (WORKER_ID,))
+    return rows[0] if rows else None
 
-    # Simulate work
-    time.sleep(3)
 
-    # Fake results for demonstration
-    return {
-        "score": 460,
-        "depth": 12,
-        "duration": 3
-    }
+def save_checkpoint(job, state):
+    call_procedure('proc_save_checkpoint',
+                   (job['job_id'], WORKER_ID, job['claim_token'], json.dumps(state)))
+
+
+def complete_job(job, score, depth, duration):
+    call_procedure('proc_complete_job',
+                   (job['job_id'], WORKER_ID, job['claim_token'], score, depth, duration))
+
+
+def mark_failed(job, reason):
+    call_procedure('proc_finish_job',
+                   (job['job_id'], WORKER_ID, job['claim_token'], 'failed',
+                    None, None, None, str(reason)))
+
+
+class ClaimLost(RuntimeError):
+    pass
+
+
+def run_solver(prefix, parameters, checkpoint, save, check_alive):
+    """Run exact search. Prefix is a JSON array of piece_id/rotation objects."""
+    pieces = load_pieces(parameters.get(
+        'pieces_file', str(Path(__file__).with_name('e2pieces.txt'))))
+    by_id = {p.id: p for p in pieces}
+    placements = [by_id[item['piece_id']].rotated(item.get('rotation', 0))
+                  for item in json.loads(prefix or '[]')]
+    start = time.monotonic()
+    result = solve_resumable(
+        pieces, size=parameters.get('size'), prefix=placements, checkpoint=checkpoint,
+        save_checkpoint=save, check_alive=check_alive,
+        checkpoint_interval=parameters.get('checkpoint_interval', 30))
+    # Exhaustive no-solution search is successful job completion with score 0.
+    n = parameters.get('size') or int(len(pieces) ** 0.5)
+    return dict(score=2 * n * (n - 1) if result['board'] else 0,
+                depth=result['depth'], duration=int(time.monotonic() - start))
+
+
+def process_job(job, solver=run_solver, heartbeat_interval=HEARTBEAT_INTERVAL):
+    """Renew only this attempt; any renewal error stops result publication."""
+    stop, lost = threading.Event(), threading.Event()
+
+    def renew():
+        while not stop.wait(heartbeat_interval):
+            try:
+                heartbeat(job)
+            except Exception:
+                LOG.exception('Heartbeat failed for job %s', job['job_id'])
+                lost.set()
+                return
+
+    def check_alive():
+        if lost.is_set():
+            raise ClaimLost('Heartbeat failed; abandon this attempt')
+
+    def save(state):
+        check_alive()
+        save_checkpoint(job, state)
+
+    thread = threading.Thread(target=renew, daemon=True)
+    thread.start()
+    try:
+        try:
+            parameters = json.loads(job['parameters']) if job['parameters'] else {}
+            checkpoint = json.loads(job['checkpoint']) if job.get('checkpoint') else None
+            result = solver(job['prefix'], parameters, checkpoint, save, check_alive)
+        except ClaimLost:
+            LOG.warning('Abandoned claim for job %s', job['job_id'])
+            return
+        except mysql.connector.Error:
+            # A checkpoint may have committed despite a lost acknowledgement.
+            LOG.exception('Database unavailable for job %s', job['job_id'])
+            return
+        except Exception as exc:
+            if not lost.is_set():
+                mark_failed(job, exc)
+            return
+        check_alive()
+        # Never mark failed after completion may have committed successfully.
+        complete_job(job, result['score'], result['depth'], result['duration'])
+    finally:
+        stop.set()
+        thread.join()
+
 
 def worker_loop():
-    print("Worker loop started.")
-
-    last_heartbeat = 0
-
     while True:
-        now = time.time()
-
-        # Heartbeat
-        if now - last_heartbeat > HEARTBEAT_INTERVAL:
+        try:
+            # Recovery works even when the optional event scheduler is disabled.
+            call_procedure('proc_recover_workers')
             heartbeat()
-            last_heartbeat = now
-
-        # Fetch jobs
-        jobs = fetch_jobs()
-
-        if not jobs:
-            time.sleep(JOB_POLL_INTERVAL)
-            continue
-
-        for job in jobs:
-            job_id = job["job_id"]
-            prefix = job["prefix"]
-            params = json.loads(job["parameters"]) if job["parameters"] else {}
-
-            try:
-                print(f"Worker {WORKER_ID} running job {job_id}")
-
-                result = run_solver(prefix, params)
-
-                complete_job(
-                    job_id,
-                    result["score"],
-                    result["depth"],
-                    result["duration"]
-                )
-
-                print(f"Job {job_id} completed.")
-
-            except Exception as e:
-                print(f"Job {job_id} failed: {e}")
-                mark_failed(job_id)
-
+            job = claim_job()
+            if job:
+                process_job(job)
+                continue
+        except (mysql.connector.Error, ClaimLost):
+            LOG.exception('Worker operation failed; retrying after poll interval')
         time.sleep(JOB_POLL_INTERVAL)
 
-if __name__ == "__main__":
-    worker_loop()
 
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO)
+    worker_loop()
