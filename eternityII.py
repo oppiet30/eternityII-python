@@ -1,7 +1,9 @@
 """MariaDB worker with fenced claims, independent heartbeats and checkpoints."""
 import json
+import hashlib
 import logging
 import os
+import re
 from pathlib import Path
 import threading
 import time
@@ -10,6 +12,8 @@ import mysql.connector
 
 from checkpoint_solver import solve_resumable
 from piece_loader import load_pieces
+from job_tools import DATA, puzzle_fingerprint, search_policy
+from solver import Piece
 
 LOG = logging.getLogger(__name__)
 WORKER_ID = int(os.environ.get('ETERNITY_WORKER_ID', '1'))
@@ -32,10 +36,15 @@ def call_procedure(name, args=()):
     try:
         cur = conn.cursor(dictionary=True)
         try:
-            cur.callproc(name, args)
+            if not re.fullmatch(r'proc_[a-z_]+', name):
+                raise ValueError('invalid procedure name')
+            cur.execute(f"CALL {name}({','.join(['%s'] * len(args))})", args)
             rows = []
-            for result in cur.stored_results():
-                rows.extend(result.fetchall())
+            while True:
+                if cur.with_rows:
+                    rows.extend(cur.fetchall())
+                if not cur.nextset():
+                    break
             return rows
         finally:
             cur.close()
@@ -55,8 +64,11 @@ def claim_job():
 
 
 def save_checkpoint(job, state):
-    call_procedure('proc_save_checkpoint',
+    call_procedure('proc_save_search_checkpoint',
                    (job['job_id'], WORKER_ID, job['claim_token'], json.dumps(state)))
+    LOG.info('Job %s: nodes=%s depth=%s/%s best_partial_score=%s elapsed=%.1fs rate=%.1f nodes/s pruned=%s',
+             job['job_id'], state['nodes'], state['current_depth'], state['max_depth'],
+             state['best_score'], state['elapsed_seconds'], state['nodes_per_second'], state['pruned'])
 
 
 def complete_job(job, score, depth, duration):
@@ -76,20 +88,50 @@ class ClaimLost(RuntimeError):
 
 def run_solver(prefix, parameters, checkpoint, save, check_alive):
     """Run exact search. Prefix is a JSON array of piece_id/rotation objects."""
-    pieces = load_pieces(parameters.get(
-        'pieces_file', str(Path(__file__).with_name('e2pieces.txt'))))
+    if parameters.get('pieces_source', 'file') == 'database':
+        conn = db()
+        try:
+            cur = conn.cursor(dictionary=True)
+            try:
+                cur.execute('SELECT * FROM pieces ORDER BY piece_id')
+                pieces = [Piece(p['piece_id'], (p['top_motif'], p['right_motif'],
+                                              p['bottom_motif'], p['left_motif'])) for p in cur.fetchall()]
+            finally:
+                cur.close()
+        finally:
+            conn.close()
+    elif parameters.get('pieces_source', 'file') == 'file':
+        path = Path(parameters.get('pieces_file', str(DATA)))
+        if parameters.get('pieces_sha256') and hashlib.sha256(path.read_bytes()).hexdigest() != parameters['pieces_sha256']:
+            raise ValueError('piece file does not match the partition batch fingerprint')
+        pieces = load_pieces(path)
+    else:
+        raise ValueError('pieces_source must be file or database')
+    if parameters.get('puzzle_fingerprint') and puzzle_fingerprint(pieces) != parameters['puzzle_fingerprint']:
+        raise ValueError('puzzle catalog does not match the partition batch fingerprint')
+    catalog = [dict(piece_id=p.id, top=p.edges[0], right=p.edges[1],
+                    bottom=p.edges[2], left=p.edges[3], edges=p.edges) for p in pieces]
+    call_procedure('proc_register_puzzle', (json.dumps(catalog),))
+    legacy = checkpoint is not None and checkpoint.get('version') == 1
+    fixed, forward, official = search_policy(pieces, parameters, legacy)
+    if legacy:
+        LOG.warning('Resuming legacy checkpoint with original unclued search rules')
     by_id = {p.id: p for p in pieces}
     placements = [by_id[item['piece_id']].rotated(item.get('rotation', 0))
                   for item in json.loads(prefix or '[]')]
-    start = time.monotonic()
+    latest = {}
+
+    def persist(state):
+        state['official_starter'] = int(official)
+        latest.update(state)
+        save(state)
+
     result = solve_resumable(
         pieces, size=parameters.get('size'), prefix=placements, checkpoint=checkpoint,
-        save_checkpoint=save, check_alive=check_alive,
+        save_checkpoint=persist, check_alive=check_alive, fixed=fixed, forward_check=forward,
         checkpoint_interval=parameters.get('checkpoint_interval', 30))
-    # Exhaustive no-solution search is successful job completion with score 0.
-    n = parameters.get('size') or int(len(pieces) ** 0.5)
-    return dict(score=2 * n * (n - 1) if result['board'] else 0,
-                depth=result['depth'], duration=int(time.monotonic() - start))
+    return dict(score=result['best_score'], depth=result['depth'],
+                duration=int(latest['elapsed_seconds']), outcome=latest['outcome'])
 
 
 def process_job(job, solver=run_solver, heartbeat_interval=HEARTBEAT_INTERVAL):
@@ -130,10 +172,14 @@ def process_job(job, solver=run_solver, heartbeat_interval=HEARTBEAT_INTERVAL):
         except Exception as exc:
             if not lost.is_set():
                 mark_failed(job, exc)
+                LOG.error('Job %s failed: %s', job['job_id'], exc)
             return
         check_alive()
         # Never mark failed after completion may have committed successfully.
         complete_job(job, result['score'], result['depth'], result['duration'])
+        LOG.info('Job %s completed: outcome=%s score=%s depth=%s duration=%ss',
+                 job['job_id'], result.get('outcome', 'completed'), result['score'],
+                 result['depth'], result['duration'])
     finally:
         stop.set()
         thread.join()
@@ -147,6 +193,7 @@ def worker_loop():
             heartbeat()
             job = claim_job()
             if job:
+                LOG.info('Claimed job %s on worker %s', job['job_id'], WORKER_ID)
                 process_job(job)
                 continue
         except (mysql.connector.Error, ClaimLost):
