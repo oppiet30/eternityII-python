@@ -2,7 +2,6 @@
 import json
 import hashlib
 import logging
-import os
 import re
 from pathlib import Path
 import threading
@@ -15,19 +14,19 @@ from piece_loader import load_pieces
 from job_tools import DATA, puzzle_fingerprint, search_policy
 from search_model import SearchModel
 from solver import Piece
+from worker_config import load_settings
 
 LOG = logging.getLogger(__name__)
-WORKER_ID = int(os.environ.get('ETERNITY_WORKER_ID', '1'))
+SETTINGS = load_settings()
+WORKER_ID = SETTINGS.worker_id
 HEARTBEAT_INTERVAL = 30
 JOB_POLL_INTERVAL = 5
 
 
 def db():
     return mysql.connector.connect(
-        host=os.environ.get('ETERNITY_DB_HOST', 'localhost'),
-        port=int(os.environ.get('ETERNITY_DB_PORT', '3306')),
-        user=os.environ.get('ETERNITY_DB_USER', 'solver'),
-        password=os.environ.get('ETERNITY_DB_PASSWORD', ''),
+        host=SETTINGS.host, port=SETTINGS.port, user=SETTINGS.user,
+        password=SETTINGS.password,
         database='eternity2', connection_timeout=10, autocommit=True)
 
 

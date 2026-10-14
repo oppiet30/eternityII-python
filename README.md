@@ -19,7 +19,7 @@ VALUES (1, 'solver-one', 4, 1);
 INSERT INTO jobs(parameters) VALUES ('{"size":16,"checkpoint_interval":30}');
 ```
 
-Set `ETERNITY_WORKER_ID`, `ETERNITY_DB_HOST`, `ETERNITY_DB_PORT`,
+Use `worker.cfg` as described below, or set `ETERNITY_WORKER_ID`, `ETERNITY_DB_HOST`, `ETERNITY_DB_PORT`,
 `ETERNITY_DB_USER` and `ETERNITY_DB_PASSWORD`, then run `python eternityII.py`.
 The database name is fixed to `eternity2`. There is no built-in password.
 Use a database account with EXECUTE on lifecycle routines and read access
@@ -98,6 +98,40 @@ Optional connection settings: `ETERNITY_TEST_HOST`, `ETERNITY_TEST_PORT`,
 `eternity2_test_<uuid>` schema, never the actual `eternity2` database. The test
 account needs CREATE/DROP database and routine/event/trigger privileges.
 GitHub Actions runs the same suite against isolated MariaDB 10.11 and 11.4 services.
+
+## Permanent worker settings
+
+Copy `worker.cfg.example` to `worker.cfg` beside `eternityII.py` on each machine:
+
+```ini
+[database]
+host = dell
+port = 3306
+user = solver
+password = your_actual_database_password
+
+[worker]
+id = 2
+```
+
+Use ID 1 on dell and ID 2 on optiplex; the host must name the shared MariaDB
+server. Values are literal: do not quote them, and percent signs in passwords
+do not invoke interpolation. On Linux, run `chmod 600 worker.cfg`. This file
+is ignored by Git; the example contains no password. An optional
+`ETERNITY_CONFIG` variable selects a different file; an explicitly selected
+missing file is an error. The default file is optional, preserving existing
+environment-only installations. Database name remains `eternity2`.
+
+Environment variables override corresponding file entries, including an
+explicitly empty password. Configuration is read at startup; restart to apply
+changes. If old exported values override the new file, unset them first.
+The documented password variable is `ETERNITY_DB_PASSWORD`, not `solverpass`.
+The latter only worked with a locally modified password lookup.
+
+For an `at` job, use the virtual environment's interpreter explicitly, e.g.
+`./venv/bin/python -u eternityII.py >> worker.log 2>&1` after changing to the
+repository folder. The new worker reads `worker.cfg` automatically; no venv
+activation or exports are necessary when that file supplies your settings.
 
 ## Upgrade an existing PR #6 installation
 

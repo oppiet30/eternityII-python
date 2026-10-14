@@ -1,0 +1,10 @@
+# Copy to worker.cfg on each machine. Do not quote values.
+# Database name remains eternity2; environment variables override this file.
+[database]
+host = localhost
+port = 3306
+user = solver
+password =
+
+[worker]
+id = 1
