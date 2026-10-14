@@ -1,7 +1,8 @@
-"""Constraint-based edge-matching puzzle solver.
+"""Constraint-based edge-matching solver with preindexed rotations.
 
-Edges are ordered (top, right, bottom, left). 0 denotes the outer border.
+Edges are ordered (top, right, bottom, left); 0 means outside border.
 """
+from collections import defaultdict
 from dataclasses import dataclass
 from math import isqrt
 
@@ -18,11 +19,23 @@ class Piece:
         return Piece(self.id, e[-turns:] + e[:-turns] if turns else e)
 
 
-def solve(pieces: list[Piece], size: int | None = None):
-    """Yield complete boards, row-major, using each piece once.
+def _candidate_index(pieces):
+    """Index unique orientations by border mask and required top/left edges."""
+    index = defaultdict(list)
+    for piece in pieces:
+        for edges in sorted({piece.rotated(k).edges for k in range(4)}):
+            top, right, bottom, left = edges
+            mask = tuple(edge == 0 for edge in edges)
+            index[(mask, top, left)].append(Piece(piece.id, edges))
+    return index
 
-    Intended for small puzzles; exhaustive search on a 16x16 board
-    requires additional pruning and distributed search.
+
+def solve(pieces: list[Piece], size: int | None = None):
+    """Yield valid boards using each piece once.
+
+    Precomputes rotations and indexes candidates by border position and
+    already-placed neighbors. This reduces candidate scans but does not make
+    exhaustive 16x16 search tractable on its own.
     """
     n = isqrt(len(pieces)) if size is None else size
     if n < 1 or n * n != len(pieces):
@@ -31,6 +44,13 @@ def solve(pieces: list[Piece], size: int | None = None):
         raise ValueError("piece IDs must be unique")
     if any(len(p.edges) != 4 for p in pieces):
         raise ValueError("every piece needs four edges")
+    index = _candidate_index(pieces)
+    # Wildcards on the top/left edges are used only at the board boundary.
+    boundary_index = defaultdict(list)
+    for (mask, top, left), variants in index.items():
+        boundary_index[(mask, top if not mask[0] else None,
+                        left if not mask[3] else None)].extend(variants)
+
     board = []
     used = set()
 
@@ -40,28 +60,18 @@ def solve(pieces: list[Piece], size: int | None = None):
             yield tuple(board)
             return
         row, col = divmod(pos, n)
-        for piece in pieces:
-            if piece.id in used:
+        mask = (row == 0, col == n - 1, row == n - 1, col == 0)
+        top = board[pos - n].edges[2] if row else None
+        left = board[-1].edges[1] if col else None
+        for candidate in boundary_index.get((mask, top, left), ()):
+            if candidate.id in used:
                 continue
-            orientations = {piece.rotated(k).edges for k in range(4)}
-            for edges in sorted(orientations):
-                top, right, bottom, left = edges
-                if (top == 0) != (row == 0):
-                    continue
-                if (left == 0) != (col == 0):
-                    continue
-                if (bottom == 0) != (row == n - 1):
-                    continue
-                if (right == 0) != (col == n - 1):
-                    continue
-                if row and board[pos - n].edges[2] != top:
-                    continue
-                if col and board[-1].edges[1] != left:
-                    continue
-                board.append(Piece(piece.id, edges))
-                used.add(piece.id)
+            board.append(candidate)
+            used.add(candidate.id)
+            try:
                 yield from search()
-                used.remove(piece.id)
+            finally:
+                used.remove(candidate.id)
                 board.pop()
 
     yield from search()
