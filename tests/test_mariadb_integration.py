@@ -323,6 +323,17 @@ def test_invalid_batch_does_not_cancel_source(backend):
     assert len(execute(backend, 'SELECT * FROM reservations')) == 1
 
 
+def test_catalog_conflict_fails_job_instead_of_retrying_forever(backend, monkeypatch):
+    register([Piece(1, (1, 0, 0, 0))])
+    monkeypatch.setattr(worker, 'load_pieces', lambda path: [Piece(1, (0, 0, 0, 0))])
+    enqueue(backend)
+    job = worker.claim_job()
+    worker.process_job(job)
+    row = execute(backend, 'SELECT status,failure_reason FROM jobs')[0]
+    assert row['status'] == 'failed'
+    assert 'Catalog conflicts' in row['failure_reason']
+
+
 def test_completion_and_recovery_race_on_expired_claim(backend):
     enqueue(backend)
     job = worker.claim_job()

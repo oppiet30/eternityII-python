@@ -15,6 +15,8 @@ class SearchModel:
             raise ValueError('piece IDs must be unique')
         if any(len(p.edges) != 4 for p in pieces):
             raise ValueError('every piece needs four edges')
+        if any(type(edge) is not int or edge < 0 for p in pieces for edge in p.edges):
+            raise ValueError('piece edges must be nonnegative integers')
         self.fixed = {}
         for item in fixed:
             row, col = item['row'], item['col']

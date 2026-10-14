@@ -97,7 +97,7 @@ Optional connection settings: `ETERNITY_TEST_HOST`, `ETERNITY_TEST_PORT`,
 `ETERNITY_TEST_USER`. Tests create and remove only a random
 `eternity2_test_<uuid>` schema, never the actual `eternity2` database. The test
 account needs CREATE/DROP database and routine/event/trigger privileges.
-GitHub Actions runs the same suite against an isolated MariaDB 11.4 service.
+GitHub Actions runs the same suite against isolated MariaDB 10.11 and 11.4 services.
 
 ## Upgrade an existing PR #6 installation
 

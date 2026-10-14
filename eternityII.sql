@@ -548,7 +548,7 @@ BEGIN
             INSERT INTO jobs(prefix,parameters) VALUES(v_prefix,p_parameters);
             SET v_job=LAST_INSERT_ID();
             INSERT INTO job_partitions(job_id,batch_id,prefix_hash)
-              VALUES(v_job,p_batch,SHA2(JSON_COMPACT(v_prefix),256));
+              VALUES(v_job,p_batch,SHA2(JSON_NORMALIZE(v_prefix),256));
             SET v_index=v_index+1;
         END WHILE;
     END IF;

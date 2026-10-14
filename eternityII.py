@@ -13,6 +13,7 @@ import mysql.connector
 from checkpoint_solver import solve_resumable
 from piece_loader import load_pieces
 from job_tools import DATA, puzzle_fingerprint, search_policy
+from search_model import SearchModel
 from solver import Piece
 
 LOG = logging.getLogger(__name__)
@@ -109,11 +110,12 @@ def run_solver(prefix, parameters, checkpoint, save, check_alive):
         raise ValueError('pieces_source must be file or database')
     if parameters.get('puzzle_fingerprint') and puzzle_fingerprint(pieces) != parameters['puzzle_fingerprint']:
         raise ValueError('puzzle catalog does not match the partition batch fingerprint')
+    legacy = checkpoint is not None and checkpoint.get('version') == 1
+    fixed, forward, official = search_policy(pieces, parameters, legacy)
+    SearchModel(pieces, parameters.get('size'), fixed)
     catalog = [dict(piece_id=p.id, top=p.edges[0], right=p.edges[1],
                     bottom=p.edges[2], left=p.edges[3], edges=p.edges) for p in pieces]
     call_procedure('proc_register_puzzle', (json.dumps(catalog),))
-    legacy = checkpoint is not None and checkpoint.get('version') == 1
-    fixed, forward, official = search_policy(pieces, parameters, legacy)
     if legacy:
         LOG.warning('Resuming legacy checkpoint with original unclued search rules')
     by_id = {p.id: p for p in pieces}
@@ -165,7 +167,11 @@ def process_job(job, solver=run_solver, heartbeat_interval=HEARTBEAT_INTERVAL):
         except ClaimLost:
             LOG.warning('Abandoned claim for job %s', job['job_id'])
             return
-        except mysql.connector.Error:
+        except mysql.connector.Error as exc:
+            if exc.sqlstate == '45000' and 'Claim lost or expired' not in str(exc):
+                mark_failed(job, exc)
+                LOG.error('Job %s rejected by database validation: %s', job['job_id'], exc)
+                return
             # A checkpoint may have committed despite a lost acknowledgement.
             LOG.exception('Database unavailable for job %s', job['job_id'])
             return
