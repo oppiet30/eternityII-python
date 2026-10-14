@@ -108,6 +108,11 @@ workers with the same connection settings. The fresh-install `eternityII.sql`
 already contains this upgrade. MariaDB 10.11+ is required. Integration tests
 exercise both fresh installs and the additive upgrade (including a repeated
 upgrade) against MariaDB 10.11 and 11.4.
+Stopped attempts may wait up to five minutes for their leases to expire before
+being requeued and resumed. Idle worker heartbeats do not renew those old job
+leases. Either machine can resume a recovered job; queued work may be claimed
+first, so restarting does not guarantee the same machine immediately resumes
+its previous job.
 
 Existing version-1 checkpoints resume the original candidate order with no
 new starter constraint or pruning. They are labeled `official_starter=0` in

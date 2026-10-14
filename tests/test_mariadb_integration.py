@@ -334,6 +334,19 @@ def test_catalog_conflict_fails_job_instead_of_retrying_forever(backend, monkeyp
     assert 'Catalog conflicts' in row['failure_reason']
 
 
+def test_partition_batch_subdivides_an_existing_prefix(backend):
+    base = [dict(piece_id=1, rotation=1)]
+    parent_id = execute(backend, 'INSERT INTO jobs(prefix,parameters) VALUES(%s,%s)',
+                        (json.dumps(base), '{}'))
+    leaves = [base + [dict(piece_id=i, rotation=2)] for i in (5, 7)]
+    jobs = worker.call_procedure('proc_enqueue_partition_batch',
+                                (str(uuid.uuid4()), json.dumps(leaves), '{}', json.dumps(base), parent_id))
+    assert len(jobs) == 2
+    assert all(json.loads(job['prefix'])[0] == base[0] for job in jobs)
+    assert execute(backend, 'SELECT status FROM jobs WHERE job_id=%s',
+                   (parent_id,))[0]['status'] == 'failed'
+
+
 def test_completion_and_recovery_race_on_expired_claim(backend):
     enqueue(backend)
     job = worker.claim_job()
