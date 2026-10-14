@@ -29,9 +29,13 @@ class SearchModel:
             self.fixed[pos] = piece
         self.reserved = {p.id: pos for pos, p in self.fixed.items()}
         self.by_mask = defaultdict(list)
+        self.top_left = defaultdict(list)
         for piece in pieces:
             for edges in sorted({piece.rotated(k).edges for k in range(4)}):
-                self.by_mask[tuple(e == 0 for e in edges)].append(Piece(piece.id, edges))
+                variant = Piece(piece.id, edges)
+                mask = tuple(e == 0 for e in edges)
+                self.by_mask[mask].append(variant)
+                self.top_left[(mask, edges[0], edges[3])].append(variant)
         self.board, self.used = [], set()
         self.domains_cache = {}
         for pos, piece in self.fixed.items():
@@ -53,6 +57,11 @@ class SearchModel:
         pos = len(self.board) if pos is None else pos
         row, col = divmod(pos, self.n)
         mask = (row == 0, col == self.n - 1, row == self.n - 1, col == 0)
+        if not self.fixed and pos == len(self.board):
+            # Keep the original indexed hot path for resumed version-1 jobs.
+            top = self.board[-self.n].edges[2] if row else 0
+            left = self.board[-1].edges[1] if col else 0
+            return [p for p in self.top_left.get((mask, top, left), ()) if p.id not in self.used]
         requirements = {}
         for edge, neighbor, opposite, exists in (
                 (0, pos - self.n, 2, row > 0), (1, pos + 1, 3, col < self.n - 1),
