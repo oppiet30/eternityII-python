@@ -37,8 +37,8 @@ def statements(script):
     assert not pending
 
 
-@pytest.fixture(scope='module')
-def database():
+@pytest.fixture(scope='module', params=('fresh', 'upgrade'))
+def database(request):
     options = dict(host=os.environ.get('ETERNITY_TEST_HOST', '127.0.0.1'),
                    port=int(os.environ.get('ETERNITY_TEST_PORT', '3306')),
                    user=os.environ.get('ETERNITY_TEST_USER', 'root'),
@@ -54,8 +54,21 @@ def database():
         script = script.replace('CREATE DATABASE IF NOT EXISTS eternity2;',
                                 f'CREATE DATABASE `{name}`;', 1)
         script = script.replace('use eternity2;', f'USE `{name}`;', 1)
+        if request.param == 'upgrade':
+            script = script.split('-- Additive upgrade from PR #6.')[0]
         for statement in statements(script):
             cur.execute(statement)
+        if request.param == 'upgrade':
+            cur.execute("INSERT INTO workers(worker_id,hostname) VALUES(987,'existing')")
+            cur.execute("INSERT INTO jobs(job_id,parameters) VALUES(987,'{}')")
+            cur.execute("INSERT INTO job_checkpoints(job_id,state) VALUES(987,'{\"version\":1,\"nodes\":42}')")
+            migration = (Path(__file__).parents[1] / 'migrations/007_search_progress.sql').read_text()
+            migration = migration.replace('USE eternity2;', f'USE `{name}`;')
+            for _ in range(2):
+                for statement in statements(migration):
+                    cur.execute(statement)
+            cur.execute('SELECT state FROM job_checkpoints WHERE job_id=987')
+            assert json.loads(cur.fetchone()[0]) == dict(version=1, nodes=42)
         yield dict(options, database=name)
     finally:
         # Only our freshly generated test schema is ever removed.
@@ -73,7 +86,8 @@ def backend(database, monkeypatch):
     monkeypatch.setattr(worker, 'WORKER_ID', 1)
     execute(database, 'ALTER EVENT ev_worker_heartbeat_check DISABLE')
     execute(database, 'ALTER EVENT ev_worker_health_update DISABLE')
-    for table in ('job_results', 'job_checkpoints', 'reservations', 'jobs', 'workers'):
+    for table in ('job_results', 'job_partitions', 'job_batches', 'job_progress',
+                  'job_checkpoints', 'reservations', 'jobs', 'board_cells', 'boards', 'pieces', 'motifs', 'workers'):
         execute(database, f'DELETE FROM {table}')
     execute(database, "INSERT INTO workers(worker_id,hostname,max_jobs) VALUES(1,'one',2),(2,'two',2)")
     return database
@@ -104,7 +118,7 @@ def claim(worker_id):
 
 def test_import_preserves_objects_and_no_triggers(backend):
     assert not execute(backend, 'SHOW TRIGGERS')
-    assert len(execute(backend, 'SHOW TABLES')) == 16
+    assert len(execute(backend, 'SHOW TABLES')) == 21
     assert execute(backend, 'SELECT * FROM view_worker_status')[0]['running_jobs'] == 0
     assert execute(backend, 'SELECT * FROM view_active_jobs') == []
     worker.call_procedure('proc_update_worker_health')
@@ -154,7 +168,8 @@ def test_expiry_recovery_retains_checkpoint_and_fences_old_attempt(backend):
     enqueue(backend)
     old = worker.claim_job()
     state = dict(version=1, next_indices=[1, 0])
-    worker.save_checkpoint(old, state)
+    worker.call_procedure('proc_save_checkpoint',
+                          (old['job_id'], 1, old['claim_token'], json.dumps(state)))
     worker.heartbeat(old)
     execute(backend, 'UPDATE reservations SET expires_at=NOW() - INTERVAL 1 SECOND')
     for action in (lambda: worker.heartbeat(old), lambda: worker.save_checkpoint(old, {}),
@@ -209,6 +224,7 @@ def test_worker_resumes_persisted_search_after_reclaim(backend, monkeypatch):
     pieces = [Piece(1, (0, 1, 2, 0)), Piece(2, (0, 0, 3, 1)),
               Piece(3, (2, 4, 0, 0)), Piece(4, (3, 0, 0, 4))]
     monkeypatch.setattr(worker, 'load_pieces', lambda path: pieces)
+    register(pieces)
     execute(backend, 'INSERT INTO jobs(parameters) VALUES(%s)',
             (json.dumps(dict(size=2, checkpoint_interval=0)),))
     old = worker.claim_job()
@@ -232,6 +248,103 @@ def test_worker_resumes_persisted_search_after_reclaim(backend, monkeypatch):
     result = execute(backend, 'SELECT score,depth_reached FROM job_results')[0]
     assert result == dict(score=4, depth_reached=4)
     assert json.loads(execute(backend, 'SELECT state FROM job_checkpoints')[0]['state'])['nodes'] == 4
+    progress = execute(backend, 'SELECT * FROM job_progress')[0]
+    assert progress['best_score'] == 4
+    assert progress['outcome'] == 'solved'
+    assert execute(backend, 'SELECT board_id FROM job_results')[0]['board_id'] == progress['best_board_id']
+    assert len(execute(backend, 'SELECT * FROM board_cells')) == 4
+
+
+def register(pieces):
+    worker.call_procedure('proc_register_puzzle', (json.dumps([
+        dict(piece_id=p.id, top=p.edges[0], right=p.edges[1], bottom=p.edges[2],
+             left=p.edges[3], edges=p.edges) for p in pieces]),))
+
+
+def test_catalog_preserves_existing_data_and_rejects_conflicts(backend):
+    piece = Piece(1, (0, 0, 0, 0))
+    register([piece])
+    execute(backend, "UPDATE motifs SET motif_name='border' WHERE motif_id=0")
+    register([piece])
+    assert execute(backend, 'SELECT motif_name FROM motifs')[0]['motif_name'] == 'border'
+    with pytest.raises(mysql.connector.Error, match='Catalog conflicts'):
+        register([Piece(1, (1, 0, 0, 0))])
+    assert execute(backend, 'SELECT top_motif FROM pieces')[0]['top_motif'] == 0
+
+
+def test_progress_board_and_checkpoint_rollback_together(backend):
+    pieces = [Piece(1, (0, 1, 2, 0)), Piece(2, (0, 0, 3, 1)),
+              Piece(3, (2, 4, 0, 0)), Piece(4, (3, 0, 0, 4))]
+    register(pieces)
+    enqueue(backend)
+    job = worker.claim_job()
+    states = []
+    solve_resumable(pieces, save_checkpoint=states.append)
+    worker.save_checkpoint(job, states[-1])
+    before = execute(backend, 'SELECT state FROM job_checkpoints')[0]['state']
+    invalid = dict(states[-1], best_board=[dict(piece_id=1, rotation=1)], best_score=0)
+    with pytest.raises(mysql.connector.Error, match='edge or border'):
+        worker.save_checkpoint(job, invalid)
+    assert execute(backend, 'SELECT state FROM job_checkpoints')[0]['state'] == before
+    assert len(execute(backend, 'SELECT * FROM board_cells')) == 4
+    execute(backend, 'UPDATE reservations SET expires_at=SYSDATE() - INTERVAL 1 SECOND')
+    with pytest.raises(mysql.connector.Error, match='Claim lost'):
+        worker.save_checkpoint(job, states[-1])
+    assert execute(backend, 'SELECT state FROM job_checkpoints')[0]['state'] == before
+
+
+def test_partition_batch_atomic_replacement_and_idempotency(backend):
+    enqueue(backend)
+    parent = worker.claim_job()
+    batch = str(uuid.uuid4())
+    prefixes = [[dict(piece_id=i, rotation=1)] for i in (1, 2, 3, 4)]
+    args = (batch, json.dumps(prefixes), '{}', '[]', parent['job_id'])
+    jobs = worker.call_procedure('proc_enqueue_partition_batch', args)
+    assert len(jobs) == 4
+    assert worker.call_procedure('proc_enqueue_partition_batch', args) == jobs
+    assert execute(backend, 'SELECT status FROM jobs WHERE job_id=%s',
+                   (parent['job_id'],))[0]['status'] == 'failed'
+    assert not execute(backend, 'SELECT * FROM reservations')
+    with pytest.raises(mysql.connector.Error):
+        worker.complete_job(parent, 480, 256, 10)
+    with pytest.raises(mysql.connector.Error, match='different contents'):
+        worker.call_procedure('proc_enqueue_partition_batch', (batch, json.dumps(prefixes), '{"size":2}', '[]', parent['job_id']))
+
+
+def test_invalid_batch_does_not_cancel_source(backend):
+    enqueue(backend)
+    parent = worker.claim_job()
+    duplicate = [[dict(piece_id=1, rotation=1)]] * 2
+    with pytest.raises(mysql.connector.Error):
+        worker.call_procedure('proc_enqueue_partition_batch',
+                             (str(uuid.uuid4()), json.dumps(duplicate), '{}', '[]', parent['job_id']))
+    assert execute(backend, 'SELECT status FROM jobs')[0]['status'] == 'running'
+    assert not execute(backend, 'SELECT * FROM job_batches')
+    assert len(execute(backend, 'SELECT * FROM reservations')) == 1
+
+
+def test_catalog_conflict_fails_job_instead_of_retrying_forever(backend, monkeypatch):
+    register([Piece(1, (1, 0, 0, 0))])
+    monkeypatch.setattr(worker, 'load_pieces', lambda path: [Piece(1, (0, 0, 0, 0))])
+    enqueue(backend)
+    job = worker.claim_job()
+    worker.process_job(job)
+    row = execute(backend, 'SELECT status,failure_reason FROM jobs')[0]
+    assert row['status'] == 'failed'
+    assert 'Catalog conflicts' in row['failure_reason']
+
+
+def test_partition_batch_subdivides_an_existing_prefix(backend):
+    base = [dict(piece_id=1, rotation=1)]
+    parent_id = execute(backend, 'INSERT INTO jobs(prefix,parameters) VALUES(%s,%s)',
+                        (json.dumps(base), '{}'))
+    leaves = [base + [dict(piece_id=i, rotation=2)] for i in (5, 7)]
+    jobs = worker.call_procedure('proc_enqueue_partition_batch',
+                                (str(uuid.uuid4()), json.dumps(leaves), '{}', json.dumps(base), parent_id))
+    assert len(jobs) == 2
+    assert all(json.loads(job['prefix'])[0] == base[0] for job in jobs)
+    assert execute(backend, 'SELECT status FROM jobs WHERE job_id=%s',
+                   (parent_id,))[0]['status'] == 'failed'
 
 
 def test_completion_and_recovery_race_on_expired_claim(backend):
